@@ -253,8 +253,113 @@ describe('automatically recognized ET-72GW accessory', () => {
     expect(t.target.getHandler()).toBeCloseTo(26.6666667);
   });
 
+  test('Off to Heat acknowledges promptly, confirms once, and never fabricates relay activity', async () => {
+    const t = setup(false, 'm2dkohai78cwr3yd', deviceID, true);
+    await jest.advanceTimersByTimeAsync(0);
+    t.shadow.mockResolvedValue({ properties: payload().properties.map(p => p.dpId === 101 ? { ...p, value: false, time: Date.now() } : p) });
+    await jest.advanceTimersByTimeAsync(300000);
+    expect(t.targetState.getHandler()).toBe(0);
+    await t.targetState.setHandler(1);
+    expect(t.targetState.getHandler()).toBe(1);
+    expect(t.state.getHandler()).toBe(0); // Acknowledged mode is not a measured relay state.
+    await t.handler.onDeviceInfoUpdate({});
+    expect(t.targetState.value).toBe(1); // Old cache must not undo the accepted command.
+    t.shadow.mockResolvedValue({ properties: payload().properties.map(p => p.dpId === 101 ? { ...p, time: Date.now() } : p) });
+    await jest.advanceTimersByTimeAsync(9999);
+    expect(t.shadow).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(t.shadow).toHaveBeenCalledTimes(3);
+    expect(t.targetState.getHandler()).toBe(1);
+    await jest.advanceTimersByTimeAsync(30000);
+    expect(t.targetState.getHandler()).toBe(1);
+    expect(t.setMode).toHaveBeenCalledTimes(1);
+    expect(t.commands).not.toHaveBeenCalled();
+  });
+
+  test('combined automation serializes Heat then 90F without waiting for the confirmation poll', async () => {
+    const t = setup(); await jest.advanceTimersByTimeAsync(0);
+    let finish!: () => void;
+    t.setMode.mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
+    const mode = t.targetState.setHandler(1);
+    const temp = t.target.setHandler((90 - 32) * 5 / 9);
+    await jest.advanceTimersByTimeAsync(0);
+    expect(t.setMode).toHaveBeenCalledTimes(1);
+    expect(t.commands).not.toHaveBeenCalled();
+    finish(); await Promise.all([mode, temp]);
+    expect(t.commands).toHaveBeenCalledTimes(1);
+    expect(t.commands).toHaveBeenCalledWith(deviceID, [{ code: 'temp_set', value: 900 }]);
+    expect(t.targetState.getHandler()).toBe(1);
+    expect(t.target.getHandler()).toBeCloseTo((90 - 32) * 5 / 9);
+    expect(t.shadow).toHaveBeenCalledTimes(1);
+  });
+
+  test('a scene arriving temperature-first still sends each explicit command exactly once', async () => {
+    const t = setup(); await jest.advanceTimersByTimeAsync(0);
+    const temp = t.target.setHandler((90 - 32) * 5 / 9);
+    const mode = t.targetState.setHandler(1);
+    await Promise.all([temp, mode]);
+    expect(t.commands).toHaveBeenCalledTimes(1);
+    expect(t.commands).toHaveBeenCalledWith(deviceID, [{ code: 'temp_set', value: 900 }]);
+    expect(t.setMode).toHaveBeenCalledTimes(1);
+    expect(t.commands.mock.invocationCallOrder[0]).toBeLessThan(t.setMode.mock.invocationCallOrder[0]);
+    expect(t.targetState.getHandler()).toBe(1);
+  });
+
+  test('removal during a mode write suppresses late notifications, confirmation and queued commands', async () => {
+    const t = setup(); await jest.advanceTimersByTimeAsync(0);
+    let finish!: () => void;
+    t.setMode.mockImplementation(() => new Promise<void>(resolve => { finish = resolve; }));
+    const mode = t.targetState.setHandler(3);
+    const temp = t.target.setHandler(25);
+    const rejected = expect(temp).rejects.toThrow(MockHapStatusError);
+    await jest.advanceTimersByTimeAsync(0);
+    t.handler.dispose(); finish();
+    await mode; await rejected;
+    await jest.advanceTimersByTimeAsync(600000);
+    expect(t.shadow).toHaveBeenCalledTimes(1);
+    expect(t.commands).not.toHaveBeenCalled();
+  });
+
+  test('unconfirmed acknowledgement expires to reported state without retrying commands', async () => {
+    const t = setup(); await jest.advanceTimersByTimeAsync(0);
+    await t.targetState.setHandler(3); // Shadow continues to report Manual.
+    expect(t.targetState.getHandler()).toBe(3);
+    await jest.advanceTimersByTimeAsync(10000);
+    expect(t.targetState.getHandler()).toBe(3);
+    await jest.advanceTimersByTimeAsync(20000);
+    expect(t.targetState.getHandler()).toBe(1);
+    expect(t.shadow).toHaveBeenCalledTimes(2);
+    expect(t.setMode).toHaveBeenCalledTimes(1);
+    expect(t.commands).not.toHaveBeenCalled();
+  });
+
+  test('failed mode write does not acknowledge or request confirmation and does not poison the queue', async () => {
+    const t = setup(); await jest.advanceTimersByTimeAsync(0);
+    t.setMode.mockRejectedValueOnce(new Error('mock failure'));
+    await expect(t.targetState.setHandler(3)).rejects.toThrow('mock failure');
+    expect(t.targetState.getHandler()).toBe(1);
+    await t.target.setHandler(25);
+    expect(t.commands).toHaveBeenCalledWith(deviceID, [{ code: 'temp_set', value: 770 }]);
+    await jest.advanceTimersByTimeAsync(30000);
+    expect(t.shadow).toHaveBeenCalledTimes(1);
+  });
+
+  test('rapid acknowledged Off to Heat uses latest requested power and cleanup cancels confirmation', async () => {
+    const t = setup(); await jest.advanceTimersByTimeAsync(0);
+    await t.targetState.setHandler(0);
+    expect(t.targetState.getHandler()).toBe(0);
+    await t.targetState.setHandler(1);
+    expect(t.setMode).toHaveBeenCalledWith(deviceID, 'Manual', true);
+    expect(t.targetState.getHandler()).toBe(1);
+    t.handler.dispose();
+    await jest.advanceTimersByTimeAsync(600000);
+    expect(t.shadow).toHaveBeenCalledTimes(1);
+  });
+
   test('mode changes with unavailable power cache do not issue a guessed power command', async () => {
     const t = setup();
+    t.shadow.mockImplementation(() => new Promise(() => {}));
+    t.handler.configureServices();
     await expect(t.targetState.setHandler(1)).rejects.toThrow(MockHapStatusError);
     expect(t.setMode).not.toHaveBeenCalled();
     expect(t.commands).not.toHaveBeenCalled();

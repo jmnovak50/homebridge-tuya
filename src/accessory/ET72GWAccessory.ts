@@ -7,9 +7,27 @@ import { configureTempDisplayUnits } from './characteristic/TemperatureDisplayUn
 /** Product-specific support for the field-verified HEATIT/Jiahong ET-72GW. */
 export default class ET72GWAccessory extends ThermostatAccessory {
   private measurements?: ET72GWMeasurements;
+  private lifecycle = 0;
+  private active = false;
+  private commandQueue: Promise<unknown> = Promise.resolve();
+  private pendingMode?: { value: number; powered: boolean; revision: number };
+  private confirmationTimer?: NodeJS.Timeout;
+
+  private enqueueCommand<T>(command: () => Promise<T>): Promise<T> {
+    const lifecycle = this.lifecycle;
+    const result = this.commandQueue.then(() => {
+      if (!this.active || lifecycle !== this.lifecycle) {
+        throw this.unavailable();
+      }
+      return command();
+    });
+    this.commandQueue = result.catch(() => undefined);
+    return result;
+  }
 
   configureServices() {
-    this.measurements?.stop();
+    this.dispose();
+    this.active = true;
     this.measurements = new ET72GWMeasurements(
       () => this.deviceManager.api.getDeviceShadow(this.device.id),
       { pollIntervalSeconds: 300, maxCacheAgeSeconds: 900, maxReportAgeSeconds: 0, maxHeatingReportAgeSeconds: 0 },
@@ -42,30 +60,51 @@ export default class ET72GWAccessory extends ThermostatAccessory {
     this.mainService().getCharacteristic(this.Characteristic.TargetHeatingCoolingState)
       .setProps({ validValues: [OFF, HEAT, AUTO] })
       .onGet(() => this.targetMode())
-      .onSet(async value => {
+      .onSet(value => this.enqueueCommand(async () => {
         this.checkOnlineStatus();
+        const lifecycle = this.lifecycle;
         if (value === OFF) {
           // Keep the established power command; do not alter the stored schedule or mode.
           await this.sendCommands([{ code: 'switch', value: false }]);
         } else if (value === HEAT || value === AUTO) {
-          const powered = this.measurements?.currentMode()?.powered ?? this.measurements?.currentHeating()?.powered;
+          const powered = this.pendingMode?.powered ?? this.measurements?.currentMode()?.powered
+            ?? this.measurements?.currentHeating()?.powered;
           if (typeof powered !== 'boolean') {
             throw this.unavailable();
           }
-          // The legacy cache also remembers a just-acknowledged Off before the next shadow poll.
-          const powerOn = !powered || this.getStatus('switch')?.value === false;
+          // The latest acknowledged mode covers rapid Off -> Heat before cloud confirmation.
+          const powerOn = !powered;
           await this.deviceManager.api.setDeviceControlMode(this.device.id, value === HEAT ? 'Manual' : 'Smart', powerOn);
         } else {
           const { HapStatusError, HAPStatus } = this.platform.api.hap;
           throw new HapStatusError(HAPStatus.INVALID_VALUE_IN_REQUEST);
         }
-      });
+        if (!this.active || lifecycle !== this.lifecycle) {
+          return;
+        }
+        // An API acknowledgement is a requested target, not a measured relay state.
+        // Hold it briefly so old shadow data cannot undo a just-accepted Home scene.
+        clearTimeout(this.confirmationTimer);
+        this.pendingMode = { value: value as number, powered: value !== OFF,
+          revision: this.measurements?.currentMode()?.revision ?? 0 };
+        this.confirmationTimer = setTimeout(() => {
+          this.pendingMode = undefined;
+          this.log.warn('ET-72GW mode confirmation timed out; using reported cloud state.');
+          this.publishMeasurements();
+        }, 30000);
+        this.confirmationTimer.unref();
+        this.measurements?.requestConfirmation();
+        this.publishMeasurements();
+      }));
     // setProps alone does not announce capability changes after a cached bridge is published.
     // Recompute/advertise the configuration once on setup; measurement polls never do this.
     this.mainService().emit('service-configurationChange');
   }
 
   private targetMode() {
+    if (this.pendingMode && this.device.online) {
+      return this.pendingMode.value;
+    }
     const sample = this.measurements?.currentMode();
     if (!sample) {
       throw this.unavailable();
@@ -89,6 +128,15 @@ export default class ET72GWAccessory extends ThermostatAccessory {
   }
 
   private publishMeasurements() {
+    const mode = this.measurements?.currentMode();
+    if (this.pendingMode && mode && mode.revision > this.pendingMode.revision) {
+      const reported = !mode.powered ? this.Characteristic.TargetHeatingCoolingState.OFF
+        : mode.mode === 'Manual' ? this.Characteristic.TargetHeatingCoolingState.HEAT : this.Characteristic.TargetHeatingCoolingState.AUTO;
+      if (reported === this.pendingMode.value) {
+        this.pendingMode = undefined;
+        clearTimeout(this.confirmationTimer);
+      }
+    }
     const sample = this.measurements?.currentFloor();
     this.mainService().getCharacteristic(this.Characteristic.CurrentTemperature)
       .updateValue(sample ? sample.celsius : this.unavailable());
@@ -115,7 +163,11 @@ export default class ET72GWAccessory extends ThermostatAccessory {
   }
 
   dispose() {
+    this.active = false;
+    this.lifecycle++;
     this.measurements?.stop();
+    clearTimeout(this.confirmationTimer);
+    this.pendingMode = undefined;
   }
 
   private fahrenheit() {
@@ -182,7 +234,7 @@ export default class ET72GWAccessory extends ThermostatAccessory {
         if (!Number.isFinite(raw) || (override?.onSet && !validScale)) {
           throw this.unavailable();
         }
-        await this.sendCommands([{ code: schema.code, value: raw }]);
+        await this.enqueueCommand(() => this.sendCommands([{ code: schema.code, value: raw }]));
       })
       .setProps(props);
   }

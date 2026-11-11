@@ -22,6 +22,51 @@ describe('ET-72GW relay/power cache on the single shadow response', () => {
     adapter = new ET72GWMeasurements(read, options, changed, () => online);
   });
   afterEach(() => { adapter.stop(); jest.restoreAllMocks(); jest.useRealTimers(); });
+  test('post-command reads coalesce, respect minimum spacing, and resume ordinary polling', async () => {
+    adapter.start(); await jest.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 10; i++) { adapter.requestConfirmation(); }
+    await jest.advanceTimersByTimeAsync(9999); expect(read).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(1); expect(read).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(299999); expect(read).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(1); expect(read).toHaveBeenCalledTimes(3);
+  });
+
+  test('a failed confirmation does not trigger a read retry before the ordinary interval', async () => {
+    adapter.start(); await jest.advanceTimersByTimeAsync(0);
+    await jest.advanceTimersByTimeAsync(20000);
+    read.mockRejectedValueOnce(new ShadowReadError('transport'));
+    adapter.requestConfirmation(); await jest.advanceTimersByTimeAsync(999);
+    expect(read).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(1); expect(read).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(299999); expect(read).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(1); expect(read).toHaveBeenCalledTimes(3);
+  });
+
+  test('confirmation respects rate-limit cooldown and authorization shutdown', async () => {
+    adapter.start(); await jest.advanceTimersByTimeAsync(0);
+    read.mockRejectedValueOnce(new ShadowReadError('rate-limit', 600));
+    adapter.requestConfirmation(); await jest.advanceTimersByTimeAsync(10000);
+    expect(read).toHaveBeenCalledTimes(2);
+    adapter.requestConfirmation(); await jest.advanceTimersByTimeAsync(599999);
+    expect(read).toHaveBeenCalledTimes(2);
+    read.mockRejectedValueOnce(new ShadowReadError('authorization'));
+    await jest.advanceTimersByTimeAsync(1); expect(read).toHaveBeenCalledTimes(3);
+    adapter.requestConfirmation(); await jest.advanceTimersByTimeAsync(900000);
+    expect(read).toHaveBeenCalledTimes(3);
+  });
+
+  test('a command during an older in-flight read schedules a separate single-flight confirmation', async () => {
+    let finish!: (value: unknown) => void;
+    read.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    adapter.start(); adapter.requestConfirmation();
+    await jest.advanceTimersByTimeAsync(2000);
+    expect(read).toHaveBeenCalledTimes(1);
+    finish(payload()); await jest.advanceTimersByTimeAsync(8000);
+    expect(read).toHaveBeenCalledTimes(2);
+    adapter.stop(); adapter.requestConfirmation();
+    await jest.advanceTimersByTimeAsync(900000); expect(read).toHaveBeenCalledTimes(2);
+  });
+
   test.each([[true,true,true],[false,true,false],[true,false,false],[false,false,false]])(
     'relay=%s power=%s reports heating=%s', async (relay,power,expected) => {
       read.mockResolvedValue(payload(relay,power)); await adapter.refresh();

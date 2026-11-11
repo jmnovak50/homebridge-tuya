@@ -7,6 +7,7 @@
  - Automatically recognize the verified HEATIT/Jiahong ET-72GW product with a dedicated accessory for measured floor temperature, relay activity and native Fahrenheit/Celsius target conversion; no device configuration is required.
 
 ### Fixed
+ - Confirm ET-72GW mode writes promptly with one bounded shadow read, protect acknowledged modes from stale cache updates, and serialize mode/setpoint requests from Home scenes.
  - Keep ET-72GW relay reports valid across independent power timestamps and avoid redundant power-on writes when selecting Auto/Manual.
 
 ## [2.7.1] - (2026.10.20)

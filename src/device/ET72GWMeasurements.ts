@@ -18,6 +18,7 @@ export interface ModeSample {
   mode?: 'Smart' | 'Manual';
   powered: boolean;
   measuredAt: number;
+  revision: number;
 }
 
 interface BooleanReport {
@@ -124,6 +125,10 @@ export class ET72GWMeasurements {
   private heatingRetrievedAt = -Infinity;
   private retrievedAt = -Infinity;
   private nextAttempt = -Infinity;
+  private lastAttempt = -Infinity;
+  private blockedUntil = -Infinity;
+  private confirmationAt?: number;
+  private modeRevision = 0;
   private inFlight?: Promise<void>;
   private pollTimer?: NodeJS.Timeout;
   private expiryTimer?: NodeJS.Timeout;
@@ -174,6 +179,21 @@ export class ET72GWMeasurements {
     void this.refresh();
   }
 
+  /** One coalesced read after an acknowledged command; never retries the command. */
+  requestConfirmation() {
+    if (this.stopped || this.authorizationFailed) {
+      return;
+    }
+    this.confirmationAt ??= performance.now() + 1000;
+    this.schedulePoll();
+  }
+
+  private attemptAt() {
+    const desired = this.confirmationAt === undefined ? this.nextAttempt
+      : Math.min(this.nextAttempt, Math.max(this.confirmationAt, this.lastAttempt + 10000));
+    return Math.max(desired, this.blockedUntil);
+  }
+
   private schedulePoll(minimumDelay = 0) {
     clearTimeout(this.pollTimer);
     if (!this.running || this.stopped || this.authorizationFailed) {
@@ -184,7 +204,7 @@ export class ET72GWMeasurements {
     this.pollTimer = setTimeout(() => {
       this.pollTimer = undefined;
       void this.refresh();
-    }, Math.max(1, minimumDelay, Math.ceil(this.nextAttempt - performance.now())));
+    }, Math.max(1, minimumDelay, Math.ceil(this.attemptAt() - performance.now())));
     this.pollTimer.unref();
   }
 
@@ -202,7 +222,7 @@ export class ET72GWMeasurements {
     if (this.stopped || this.authorizationFailed) {
       return Promise.resolve();
     }
-    if (performance.now() < this.nextAttempt) {
+    if (performance.now() < this.attemptAt()) {
       this.schedulePoll();
       return Promise.resolve();
     }
@@ -210,7 +230,9 @@ export class ET72GWMeasurements {
       this.schedulePoll(this.options.pollIntervalSeconds * 1000);
       return Promise.resolve();
     }
-    this.nextAttempt = performance.now() + this.options.pollIntervalSeconds * 1000;
+    this.confirmationAt = undefined;
+    this.lastAttempt = performance.now();
+    this.nextAttempt = this.lastAttempt + this.options.pollIntervalSeconds * 1000;
     this.inFlight = this.retrieve().finally(() => {
       this.inFlight = undefined;
       this.schedulePoll();
@@ -280,7 +302,7 @@ export class ET72GWMeasurements {
           mode = report.value;
           measuredAt = report.time;
         }
-        this.modeSample = { mode, powered: power.value, measuredAt };
+        this.modeSample = { mode, powered: power.value, measuredAt, revision: ++this.modeRevision };
         this.modeRetrievedAt = performance.now();
       } catch {
         this.modeSample = undefined;
@@ -298,7 +320,7 @@ export class ET72GWMeasurements {
           this.modeSample = undefined;
           clearTimeout(this.pollTimer);
         } else if (error.kind === 'rate-limit') {
-          this.nextAttempt = Math.max(this.nextAttempt, performance.now() + error.retryAfterSeconds * 1000);
+          this.blockedUntil = Math.max(this.nextAttempt, performance.now() + error.retryAfterSeconds * 1000);
         }
       }
       // Transport/session failures keep a last validated sample only until its configured expiry.
